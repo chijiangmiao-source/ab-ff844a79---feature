@@ -45,6 +45,14 @@
   pre.ev { background:#0d1322; border:1px solid var(--line); border-radius:6px; padding:8px; font-size:12px; overflow:auto; margin:6px 0 0; }
   .seq { font-family:ui-monospace,monospace; }
   .seq span.more::before { content:" → "; color:var(--muted); }
+  #history.ok { border-left:4px solid var(--accent); }
+  #history.bad { border-left:4px solid var(--warn); }
+  .seg { border:1px solid var(--line); border-radius:8px; padding:8px 10px; margin:8px 0; background:#121a2b; }
+  .seg.initial { border-style:dashed; }
+  .seg .rng { font-family:ui-monospace,monospace; font-weight:600; }
+  .hint { color:var(--warn); font-size:12.5px; }
+  .pill.initial { background:#333a4a; color:#b8c2d8; }
+  .pill.transfer { background:#15433a; color:#7df0c8; }
 </style>
 </head>
 <body>
@@ -60,6 +68,7 @@
       <div class="row">
         <button class="ghost" data-scn="missingAcquire">缺少获取的跨队列读取（应拒绝）</button>
         <button class="ghost" data-scn="completeTransfer">完整移交后读取（应通过）</button>
+        <button class="ghost" data-scn="partialRewrite">部分重写后的分段沿革（应通过）</button>
         <button class="ghost" data-scn="deadlock">死锁环（应拒绝）</button>
       </div>
     </div>
@@ -95,6 +104,21 @@
     <div class="panel" id="result">
       <h2>复核结果</h2>
       <p class="muted">在左侧录入或载入场景后点击“提交复核”。复核器在 Worker 中按队列顺序与信号量等待建立偏序，并逐单元维护属主、最新写版本与待获取移交状态。</p>
+    </div>
+
+    <div class="panel" id="history">
+      <h2>区间访问证据沿革</h2>
+      <p class="muted">复核通过后，选择缓冲区与半开区间 [start,end)，查看其中各单元从初始状态到最终可见版本的实际写入、释放、获取与读取沿革。证据完全相同的连续单元合并为一段。</p>
+      <div class="row">
+        <select id="histBuffer" disabled></select>
+        <span class="muted">[</span>
+        <input type="number" id="histStart" min="0" value="0" disabled />
+        <span class="muted">,</span>
+        <input type="number" id="histEnd" min="1" value="1" disabled />
+        <span class="muted">)</span>
+        <button id="histBtn" disabled>查看沿革</button>
+      </div>
+      <div id="histBody"><p class="hint">尚无成功复核结论：请先录入并通过一次复核，再选择缓冲区与区间。</p></div>
     </div>
   </section>
 </main>
@@ -258,6 +282,7 @@ function renderResult(box, r) {
   box.innerHTML = '';
   if (r.ok) {
     box.className = 'panel ok';
+    enableHistoryPanel(r);
     box.append(el('h2', null, '复核结果'));
     box.append(el('p', null, '✅ ')); box.lastChild.append(el('span', 'badge-ok', '通过'));
     box.lastChild.append(document.createTextNode('：所有区间读写均有完整的同步与所有权移交证据。'));
@@ -313,6 +338,7 @@ function renderResult(box, r) {
     box.append(t2);
   } else {
     box.className = 'panel bad';
+    resetHistoryPanel('当前复核未通过：请先修正录入并取得通过结论，再查看区间沿革（不展示任何旧证据）。');
     box.append(el('h2', null, '复核结果'));
     const p = el('p', null, '⛔ '); p.append(el('span', 'badge-bad', '拒绝'));
     p.append(document.createTextNode(` [${r.code}] ${r.message}`));
@@ -340,6 +366,157 @@ function renderResult(box, r) {
 
 // 复核在 Web Worker 中完成（偏序构建 + 逐单元模拟），不可用时回退到 HTTP API
 let reviewWorker = null;
+let lastSuccessResult = null;
+let lastVerifyInput = null;
+
+function resetHistoryPanel(message) {
+  lastSuccessResult = null;
+  const sel = document.getElementById('histBuffer');
+  sel.innerHTML = ''; sel.disabled = true;
+  const start = document.getElementById('histStart');
+  const end = document.getElementById('histEnd');
+  start.value = 0; end.value = 1; start.disabled = true; end.disabled = true;
+  document.getElementById('histBtn').disabled = true;
+  const body = document.getElementById('histBody');
+  body.innerHTML = '';
+  body.append(el('p', 'hint', message || '尚无成功复核结论：请先在左侧录入并点击“提交复核”，取得通过结论后再选择缓冲区与区间。'));
+}
+
+function enableHistoryPanel(result) {
+  lastSuccessResult = result;
+  const sel = document.getElementById('histBuffer');
+  sel.innerHTML = '';
+  (result.buffers || []).forEach((b) => {
+    const o = document.createElement('option');
+    o.value = b.name; o.textContent = `${b.name}（长度 ${b.length}）`;
+    sel.append(o);
+  });
+  sel.disabled = false;
+  const first = (result.buffers || [])[0];
+  const start = document.getElementById('histStart');
+  const end = document.getElementById('histEnd');
+  start.disabled = false; end.disabled = false;
+  if (first) { start.value = 0; end.value = first.length; }
+  document.getElementById('histBtn').disabled = false;
+  const body = document.getElementById('histBody');
+  body.innerHTML = '';
+  body.append(el('p', 'muted', '复核已通过：选择缓冲区与半开区间 [start,end) 后点击“查看沿革”。'));
+}
+
+function histRange() {
+  const sel = document.getElementById('histBuffer');
+  return { buffer: sel.value, start: Number(document.getElementById('histStart').value), end: Number(document.getElementById('histEnd').value) };
+}
+
+function historyViaApi(range) {
+  // HTTP 回退重放产生该通过结论的同一份录入（而非回传可能很大的结论），
+  // 服务端与 Worker 共用 buildRangeHistory，沿革逐字段一致。
+  return fetch('/api/history', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ input: lastVerifyInput, range })
+  }).then((resp) => resp.json());
+}
+
+function viaText(via) {
+  if (!via) return '';
+  if (via.kind === 'semaphore') {
+    return `信号量 ${via.semaphore}（来源队列 ${via.sourceQueue || '?'} signal → wait v${via.waitValue}）`;
+  }
+  if (via.kind === 'queue-order') return `同队列顺序（${via.queue}）`;
+  if (via.kind === 'transitive') return '信号量/队列顺序传递';
+  return via.kind;
+}
+
+function renderHistory(h) {
+  const body = document.getElementById('histBody');
+  body.innerHTML = ''; // 改选/重查时先清空，绝不残留上一段旧证据
+  if (!h.ok) {
+    const advice = {
+      NO_SUCCESSFUL_REVIEW: '请先点击“提交复核”并取得通过结论。',
+      UNKNOWN_BUFFER: '请从下拉框选择本次复核声明过的缓冲区。',
+      INVALID_RANGE: '请按 0 ≤ start < end ≤ 缓冲区长度 重新填写半开区间。'
+    }[h.code] || '请修正后重试。';
+    body.append(el('p', 'hint', `⛔ ${h.message}`));
+    body.append(el('p', 'hint', `可操作提示：${advice}`));
+    return;
+  }
+
+  const head = el('p', 'muted', `缓冲区 ${h.buffer}[${h.start}..${h.end - 1}]，共 ${h.end - h.start} 个单元，切分为 ${h.segments.length} 个连续不重叠片段：`);
+  body.append(head);
+
+  h.segments.forEach((seg) => {
+    const card = el('div', `seg${seg.initial ? ' initial' : ''}`);
+    const title = el('div');
+    const rng = el('span', 'rng', `${h.buffer}[${seg.start}..${seg.end - 1}]`);
+    title.append(rng, document.createTextNode('（单元 '));
+    title.append(el('span', 'muted', seg.end - seg.start === 1 ? '1 个' : `${seg.start}..${seg.end - 1} 共 ${seg.end - seg.start} 个`));
+    title.append(document.createTextNode('）'));
+    if (seg.initial) {
+      title.append(el('span', 'pill initial', '初始状态'));
+      title.append(document.createTextNode(' 从未写入，保持初始状态（无属主、v0、无移交证据）。'));
+      card.append(title);
+      body.append(card);
+      return;
+    }
+    title.append(document.createTextNode(' 最终可见版本 '));
+    title.append(el('span', 'badge-ok', `v${seg.finalVersion}`));
+    title.append(document.createTextNode(`，当时属主 ${seg.finalOwner || '无'}`));
+    card.append(title);
+
+    const list = el('div');
+    seg.events.forEach((ev) => {
+      const line = el('div');
+      line.style.margin = '4px 0';
+      const at = ev.order + 1;
+      line.append(el('span', 'muted', `#${at} `));
+      line.append(el('span', `pill ${ev.kind}`, ev.kind));
+      line.append(document.createTextNode(` ${ev.submissionId}@${ev.queue} · v${ev.version} · 操作后属主 ${ev.ownerAfter || '无'}`));
+      list.append(line);
+      if (ev.releaseBy) {
+        list.append(el('div', 'muted', `　releaseBy=${ev.releaseBy}`));
+      }
+      if (ev.evidence) {
+        const evLine = el('div', 'muted', `　跨队列移交：${ev.evidence.fromQueue} → ${ev.evidence.toQueue}，releaseBy=${ev.evidence.releaseBy}，acquireBy=${ev.evidence.acquireBy}，来源：${viaText(ev.evidence.via)}`);
+        list.append(evLine);
+      }
+    });
+    card.append(list);
+    body.append(card);
+  });
+}
+
+function viewHistory() {
+  if (!lastSuccessResult) {
+    renderHistory({ ok: false, code: 'NO_SUCCESSFUL_REVIEW', message: '尚无成功的复核结论。' });
+    return;
+  }
+  const range = histRange();
+  document.getElementById('histBody').innerHTML = '<p class="muted">沿革生成中（Worker）…</p>';
+  const w = getWorker();
+  if (w && !w._busy) {
+    const timer = setTimeout(() => {
+      try { w.terminate(); } catch { /* ignore */ }
+      reviewWorker = null;
+      historyViaApi(range).then(renderHistory);
+    }, 4000);
+    w._busy = true;
+    w.onmessage = (e) => {
+      clearTimeout(timer);
+      w._busy = false;
+      renderHistory(e.data);
+    };
+    w.onerror = () => {
+      clearTimeout(timer);
+      w._busy = false;
+      reviewWorker = null;
+      historyViaApi(range).then(renderHistory);
+    };
+    w.postMessage({ input: lastVerifyInput, range });
+    return;
+  }
+  historyViaApi(range).then(renderHistory);
+}
 function getWorker() {
   if (reviewWorker) return reviewWorker;
   try {
@@ -363,7 +540,10 @@ function verifyPage() {
   const box = document.getElementById('result');
   box.className = 'panel';
   box.innerHTML = '<h2>复核结果</h2><p class="muted">复核中（Worker 偏序分析）…</p>';
+  // 新一轮复核开始即作废旧结论与旧沿革
+  resetHistoryPanel('复核进行中：取得新的通过结论后即可选择缓冲区与区间。');
   const input = gatherInput();
+  lastVerifyInput = input;
   const w = getWorker();
   if (w && !w._busy) {
     const timer = setTimeout(() => {
@@ -408,6 +588,24 @@ document.getElementById('addSubmission').onclick = () => {
   renderAll();
 };
 document.getElementById('verifyBtn').onclick = verifyPage;
+document.getElementById('histBtn').onclick = viewHistory;
+const clearStaleHistory = () => {
+  // 改选缓冲区或区间后立即清空旧沿革，点击“查看沿革”才展示新证据
+  if (!lastSuccessResult) return;
+  const body = document.getElementById('histBody');
+  body.innerHTML = '';
+  body.append(el('p', 'muted', '已改选缓冲区/区间：点击“查看沿革”生成新沿革。'));
+};
+document.getElementById('histBuffer').onchange = () => {
+  const b = lastSuccessResult && lastSuccessResult.buffers.find((x) => x.name === document.getElementById('histBuffer').value);
+  if (b) {
+    document.getElementById('histStart').value = 0;
+    document.getElementById('histEnd').value = b.length;
+  }
+  clearStaleHistory();
+};
+document.getElementById('histStart').oninput = clearStaleHistory;
+document.getElementById('histEnd').oninput = clearStaleHistory;
 document.getElementById('exportBtn').onclick = () => {
   const blob = new Blob([JSON.stringify(gatherInput(), null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
@@ -419,6 +617,7 @@ document.querySelectorAll('[data-scn]').forEach((btn) => {
       loadScenario(all[btn.getAttribute('data-scn')]);
       document.getElementById('result').className = 'panel';
       document.getElementById('result').innerHTML = '<h2>复核结果</h2><p class="muted">场景已载入，点击“提交复核”。</p>';
+      resetHistoryPanel('已载入新场景：请先点击“提交复核”取得通过结论。');
     });
   };
 });
@@ -428,6 +627,7 @@ window.verifyPage = verifyPage;
 window.renderResult = renderResult;
 fetch('/api/scenarios').then((r) => r.json()).then((all) => loadScenario(all.missingAcquire)).catch(() => renderAll());
 renderAll();
+resetHistoryPanel();
 </script>
 </body>
 </html>

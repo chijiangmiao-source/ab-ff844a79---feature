@@ -26,7 +26,25 @@
 3. 跨队列读只有在 **释放 + 信号量先后关系 + 获取** 三类证据完整匹配时才可见。
 4. 通过时返回：可执行次序（拓扑序）、每个提交受影响区间（读/写/释放/获取，含版本与移交证据）、完整移交记录。
 
+## 区间访问证据沿革
+
+复核通过后，审查员可在操作页选择**缓冲区**与**半开单元区间 `[start,end)`**，查看其中各单元
+从初始状态到最终可见版本的沿革，而不必逐条比对提交摘要：
+
+- 沿革严格按**可执行次序**列出实际触及该区间的 `write` / `release` / `acquire` / `read`；
+- 连续且沿革证据（版本、当时所有者、提交编号、跨队列移交的 `releaseBy`/`acquireBy`/信号量来源）
+  完全相同的单元**合并为一段**展示；
+- 区间内只有部分单元被后来写入或移交时，切分为**互不重叠、首尾相接的连续片段**，
+  绝不用某个单元的证据覆盖邻近单元；
+- 从未写入的单元单独成段，明确标注**保持初始状态**（无属主、`v0`、无移交证据）。
+
+沿革由 Worker 与 HTTP **共用同一份引擎函数**（`buildRangeHistory`）生成：改选缓冲区或区间后，
+浏览器 Worker 结果与 `POST /api/history` 结果逐字段一致。非法区间返回 `INVALID_RANGE`、
+未知缓冲区返回 `UNKNOWN_BUFFER`、尚无成功复核结论返回 `NO_SUCCESSFUL_REVIEW`，均给出可操作提示，
+且页面立即清空，不误展示上一次的旧证据。
+
 复核在浏览器 **Web Worker**（`src/verifier/worker.js`）中执行，HTTP `POST /api/verify` 提供同构实现用于冒烟。
+区间沿革：浏览器复用 Worker（`{input, range}` 消息），HTTP 为 `POST /api/history`。
 
 ## 本地运行
 
@@ -39,6 +57,7 @@ npm start                 # http://localhost:3000/
 - 健康响应：`GET /health`
 - 标准场景：`GET /api/scenarios`
 - 复核：`POST /api/verify`
+- 区间沿革：`POST /api/history`（体为 `{input, range}` 或 `{result, range}`；`range` 为 `{buffer, start, end}`，`end` 省略取整段缓冲区）
 
 ## Compose
 
@@ -50,11 +69,14 @@ docker compose run --rm verify       # 一次性验收服务，以退出码报�
 
 `verify` 服务依次执行：
 
-1. 规则代码测试（`node --test`，含 Worker 协议、两类读取场景、死锁环、错误属主、过期版本等）；
-2. 操作页构建检查（结构与内联脚本可编译、Worker 接线）；
+1. 规则代码测试（`node --test`，含 Worker 协议（复核与沿革）、两类读取场景、部分重写分段沿革、死锁环、错误属主、过期版本等）；
+2. 操作页构建检查（结构与内联脚本可编译、Worker 接线、沿革面板接线）；
 3. API/HTTP 冒烟：
    - “缺少获取的跨队列读取” → HTTP 422 / `MISSING_ACQUIRE`，定位提交与单元范围；
-   - “完整移交后读取” → HTTP 200，呈现可执行次序、版本 v1 与移交证据（releaseBy/acquireBy/via=semaphore）。
+   - “完整移交后读取” → HTTP 200，呈现可执行次序、版本 v1 与移交证据（releaseBy/acquireBy/via=semaphore）；
+   - “部分重写后的分段沿革” → HTTP 200，切分为 `[0,4)` v1 移交段 / `[4,6)` v2 重写段 / `[6,8)` 初始段；
+   - 非法区间 / 未知缓冲区 / 尚无通过结论 → 422 且带可操作错误码，不附旧沿革；
+   - Worker 引擎与 HTTP `/api/history` 对完整移交、部分重写两种场景沿革逐字段一致。
 
 退出码 `0` 表示验收通过，非 `0` 表示失败。
 

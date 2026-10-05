@@ -197,16 +197,21 @@ function analyze(input) {
   }
 
   // ---- 5. 按可执行序逐单元模拟 ----
-  const cells = new Map(); // key -> { owner, writer, version, pending, transfer }
+  const cells = new Map(); // key -> { owner, writer, version, pending, transfer, events }
   const getCell = (buffer, offset) => {
     const key = rangeKey(buffer, offset);
-    if (!cells.has(key)) cells.set(key, { owner: null, writer: null, version: 0, pending: null, transfer: null });
+    if (!cells.has(key)) cells.set(key, { owner: null, writer: null, version: 0, pending: null, transfer: null, events: [] });
     return cells.get(key);
   };
 
   const executed = [];
   const transfers = [];
   const summary = {};
+
+  // 记录某单元被本次操作实际触及的沿革事件（按可执行序）
+  const recordEvent = (cell, ev) => {
+    cell.events.push({ order: executed.length, ownerAfter: cell.owner, ...ev });
+  };
 
   for (const si of schedule) {
     const s = subs[si];
@@ -231,6 +236,7 @@ function analyze(input) {
           cell.owner = s.queue;
           cell.writer = s.id;
           cell.transfer = null; // 新写使旧移交证据失效
+          recordEvent(cell, { kind: 'write', submissionId: s.id, queue: s.queue, version: cell.version, writer: s.id });
           seg.writes.push({ ...opRange, access: 'write', version: cell.version });
         }
       } else if (op.type === 'release') {
@@ -244,6 +250,7 @@ function analyze(input) {
             });
           }
           cell.pending = { releaseBy: s.id, fromQueue: s.queue, version: cell.version, releaseIndex: si };
+          recordEvent(cell, { kind: 'release', submissionId: s.id, queue: s.queue, version: cell.version, releaseBy: s.id });
           seg.releases.push({ ...opRange, version: cell.version });
         }
       } else if (op.type === 'acquire') {
@@ -287,6 +294,7 @@ function analyze(input) {
           transfers.push({ buffer: c.buffer, offset: c.offset, ...evidence });
           cell.pending = null;
           acquired.add(rangeKey(c.buffer, c.offset));
+          recordEvent(cell, { kind: 'acquire', submissionId: s.id, queue: s.queue, version: cell.version, evidence });
           seg.acquires.push({ buffer: c.buffer, start: c.offset, end: c.offset + 1, version: cell.version, evidence });
         }
       } else {
@@ -337,6 +345,10 @@ function analyze(input) {
           } else if (cell.transfer) {
             evidence = cell.transfer; // 本队列经完整移交取得，呈现移交证据
           }
+          recordEvent(cell, {
+            kind: 'read', submissionId: s.id, queue: s.queue, version: cell.version,
+            ...(evidence ? { evidence } : {})
+          });
           seg.reads.push({
             buffer: c.buffer, start: c.offset, end: c.offset + 1, access: 'read',
             version: cell.version, evidence
@@ -375,23 +387,138 @@ function analyze(input) {
     }))
   );
 
+  // 逐单元沿革：只收集输入中声明过的缓冲区单元，按偏移升序，事件已按可执行序记录
+  const cellHistories = {};
+  for (const buf of input.buffers) {
+    const byOffset = {};
+    for (let off = 0; off < buf.length; off += 1) {
+      const cell = cells.get(rangeKey(buf.name, off));
+      if (cell && cell.events.length) byOffset[off] = cell.events.map((e) => ({ ...e }));
+    }
+    cellHistories[buf.name] = byOffset;
+  }
+
   return {
     ok: true,
     executableOrder: executed,
     affectedRanges,
     transfers: transferSegments,
-    timelines: Object.fromEntries([...signalIndexOf.entries()].map(([k, v]) => [k, { signaled: v }]))
+    timelines: Object.fromEntries([...signalIndexOf.entries()].map(([k, v]) => [k, { signaled: v }])),
+    buffers: input.buffers.map((b) => ({ name: b.name, length: b.length })),
+    cellHistories
   };
 }
 
-  return { analyze };
+function historyError(code, message) {
+  return { ok: false, code, message };
+}
+
+// 依据一次“通过”的复核结论，构建某缓冲区半开区间 [start,end) 的单元访问证据沿革。
+// Worker 与 HTTP 共用此实现，保证两侧沿革完全一致。
+// 连续且沿革事件（版本/当时所有者/提交编号/releaseBy/acquireBy/信号量来源）完全相同的
+// 单元合并为同一段；只有部分单元被后来写入或移交时切分为不重叠的连续片段；
+// 未写入的单元单独成段并明确保持初始状态（无属主、v0）。
+function buildRangeHistory(result, range) {
+  if (!result || result.ok !== true || !result.cellHistories) {
+    return historyError('NO_SUCCESSFUL_REVIEW', '尚无成功的复核结论，请先让复核通过后再查看区间沿革');
+  }
+  const sel = range || {};
+  const buffer = sel.buffer;
+  const decl = Array.isArray(result.buffers) ? result.buffers.find((b) => b.name === buffer) : null;
+  if (!decl) {
+    const names = (result.buffers || []).map((b) => b.name).join('、') || '无';
+    return historyError('UNKNOWN_BUFFER', `缓冲区 “${buffer}” 不在本次复核声明中（可选：${names}）`);
+  }
+  const length = decl.length;
+  const start = sel.start === undefined || sel.start === null ? 0 : Number(sel.start);
+  const end = sel.end === undefined || sel.end === null ? length : Number(sel.end);
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end > length || start >= end) {
+    return historyError('INVALID_RANGE', `区间非法：需要 0 ≤ start < end ≤ ${length}（半开区间 [start,end)，当前 start=${sel.start}, end=${sel.end}）`);
+  }
+
+  const byOffset = result.cellHistories[buffer] || {};
+  // 单元沿革指纹：事件序列的版本/属主/提交/移交证据逐项一致才视为同一段
+  const fingerprint = (events) => JSON.stringify(events.map((e) => ({
+    order: e.order, kind: e.kind, submissionId: e.submissionId, queue: e.queue,
+    version: e.version, ownerAfter: e.ownerAfter,
+    writer: e.writer || null, releaseBy: e.releaseBy || null,
+    evidence: e.evidence || null
+  })));
+
+  const unitSignatures = [];
+  for (let off = start; off < end; off += 1) {
+    const events = byOffset[off] || [];
+    unitSignatures.push({ offset: off, events, sig: events.length ? fingerprint(events) : '∅' });
+  }
+
+  const segments = [];
+  let cur = null;
+  for (const u of unitSignatures) {
+    if (cur && cur.sig === u.sig) {
+      cur.end = u.offset + 1;
+    } else {
+      if (cur) segments.push(cur);
+      cur = {
+        buffer, start: u.offset, end: u.offset + 1, sig: u.sig,
+        written: u.events.length > 0,
+        events: u.events.map((e) => ({ ...e }))
+      };
+    }
+  }
+  if (cur) segments.push(cur);
+
+  const finalize = (seg) => {
+    const out = { start: seg.start, end: seg.end, written: seg.written };
+    if (!seg.written) {
+      out.finalVersion = 0;
+      out.finalOwner = null;
+      out.initial = true; // 明确保持初始状态：从未写入
+      out.events = [];
+      return out;
+    }
+    const last = seg.events[seg.events.length - 1];
+    out.finalVersion = last.version;
+    out.finalOwner = last.ownerAfter;
+    out.events = seg.events.map((e) => {
+      const ev = {
+        order: e.order, kind: e.kind, submissionId: e.submissionId,
+        queue: e.queue, version: e.version, ownerAfter: e.ownerAfter
+      };
+      if (e.writer) ev.writer = e.writer;
+      if (e.releaseBy) ev.releaseBy = e.releaseBy;
+      if (e.evidence) ev.evidence = e.evidence;
+      return ev;
+    });
+    return out;
+  };
+
+  return {
+    ok: true,
+    buffer,
+    start,
+    end,
+    segments: segments.map(finalize),
+    executableOrder: result.executableOrder
+  };
+}
+
+  return { analyze, buildRangeHistory };
 });
 
 // Web Worker 消息协议（仅在 Worker realm 注册；Node 下 require 不受影响）
+//   { input }                  -> analyze(input)
+//   { input, range }           -> analyze(input) 通过后 buildRangeHistory(result, range)
+//   { result, range }          -> 仅对已有通过结论构建沿革
 if (typeof self !== 'undefined' && typeof self.importScripts === 'function') {
   self.onmessage = (e) => {
     try {
-      self.postMessage(self.analyze(e.data && e.data.input));
+      const data = e.data || {};
+      if (data.range) {
+        const result = data.result || self.analyze(data.input);
+        self.postMessage(result && result.ok ? self.buildRangeHistory(result, data.range) : result);
+      } else {
+        self.postMessage(self.analyze(data.input));
+      }
     } catch (ex) {
       self.postMessage({ ok: false, code: 'WORKER_ERROR', message: String((ex && ex.stack) || ex) });
     }

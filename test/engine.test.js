@@ -2,7 +2,7 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { analyze } = require('../src/verifier/engine');
+const { analyze, buildRangeHistory } = require('../src/verifier/engine');
 const scenarios = require('../src/scenarios');
 
 const base = (submissions, extra = {}) => ({
@@ -169,4 +169,102 @@ test('结构校验：超上限与越界区间被拒绝', () => {
     { id: 'A', queue: 'Q0', operations: [{ type: 'write', buffer: 'f', offset: 14, length: 4 }] }
   ]);
   assert.equal(analyze(overrun).code, 'STRUCTURE_INVALID');
+});
+
+// ---- 区间访问证据沿革 ----
+
+test('部分重写：通过复核后整段沿革切分为不重叠连续片段，未写入单元保持初始状态', () => {
+  const r = analyze(scenarios.partialRewrite.input);
+  assert.equal(r.ok, true, JSON.stringify(r));
+
+  const h = buildRangeHistory(r, { buffer: 'frameB', start: 0, end: 8 });
+  assert.equal(h.ok, true, JSON.stringify(h));
+  assert.deepEqual(h.segments.map((s) => [s.start, s.end]), [[0, 4], [4, 6], [6, 8]]);
+
+  // 片段必须互不重叠且恰好覆盖所选区间
+  let covered = 0;
+  h.segments.forEach((s, i) => {
+    if (i > 0) assert.equal(s.start, h.segments[i - 1].end, '片段必须首尾相接、不重叠');
+    covered += s.end - s.start;
+  });
+  assert.equal(covered, 8);
+
+  const [stay, rewritten, untouched] = h.segments;
+  assert.equal(stay.finalVersion, 1);
+  assert.equal(stay.finalOwner, 'encode-q');
+  assert.equal(stay.initial, undefined);
+  assert.deepEqual(stay.events.map((e) => e.kind), ['write', 'release', 'acquire', 'read']);
+  // 移交证据：releaseBy/acquireBy/信号量来源完整
+  const acquireEv = stay.events.find((e) => e.kind === 'acquire');
+  assert.equal(acquireEv.evidence.releaseBy, 'D1');
+  assert.equal(acquireEv.evidence.acquireBy, 'E1');
+  assert.equal(acquireEv.evidence.via.kind, 'semaphore');
+  assert.equal(acquireEv.evidence.via.semaphore, 'timeline/decode');
+  // release 事件携带 releaseBy
+  assert.equal(stay.events.find((e) => e.kind === 'release').releaseBy, 'D1');
+
+  // 只有部分单元被后来写入：[4,6) 为 v2，不能用邻段 v1 证据覆盖
+  assert.equal(rewritten.finalVersion, 2);
+  assert.deepEqual(rewritten.events.map((e) => e.kind), ['write', 'release', 'acquire', 'read', 'write']);
+  assert.equal(rewritten.events[4].submissionId, 'E1');
+
+  // 未写入单元明确保持初始状态
+  assert.equal(untouched.initial, true);
+  assert.equal(untouched.written, false);
+  assert.equal(untouched.finalOwner, null);
+  assert.equal(untouched.finalVersion, 0);
+  assert.deepEqual(untouched.events, []);
+});
+
+test('沿革：证据完全相同的连续单元合并为一段', () => {
+  const r = analyze(scenarios.completeTransfer.input);
+  assert.equal(r.ok, true);
+  const h = buildRangeHistory(r, { buffer: 'frameA', start: 0, end: 12 });
+  // [0,8) 证据完全一致合并；[8,12) 仅被 E1 写过 v1，另成一段
+  assert.deepEqual(h.segments.map((s) => [s.start, s.end]), [[0, 8], [8, 12]]);
+  const first = h.segments[0];
+  assert.deepEqual(first.events.map((e) => e.kind), ['write', 'release', 'acquire', 'read']);
+  // 事件按可执行序排列
+  assert.deepEqual(first.events.map((e) => e.order), [0, 0, 1, 1]);
+  const second = h.segments[1];
+  assert.deepEqual(second.events.map((e) => e.kind), ['write']);
+  assert.equal(second.finalOwner, 'encode-q');
+});
+
+test('沿革：事件按可执行次序记录写入/释放/获取/读取', () => {
+  const r = analyze(base([
+    { id: 'A', queue: 'Q0', signal: { semaphore: 't' }, operations: [{ type: 'write', buffer: 'f', offset: 0, length: 1 }] },
+    { id: 'B', queue: 'Q0', operations: [
+      { type: 'release', buffer: 'f', offset: 0, length: 1 },
+      { type: 'write', buffer: 'f', offset: 1, length: 1 }
+    ] }
+  ]));
+  assert.equal(r.ok, true, JSON.stringify(r));
+  const h = buildRangeHistory(r, { buffer: 'f', start: 0, end: 2 });
+  assert.deepEqual(h.segments.map((s) => [s.start, s.end]), [[0, 1], [1, 2]]);
+  assert.deepEqual(h.segments[0].events.map((e) => `${e.kind}@${e.submissionId}`), ['write@A', 'release@B']);
+  assert.deepEqual(h.segments[1].events.map((e) => `${e.kind}@${e.submissionId}`), ['write@B']);
+});
+
+test('沿革：非法区间与未知缓冲区给出可操作错误码', () => {
+  const r = analyze(scenarios.partialRewrite.input);
+  assert.equal(buildRangeHistory(r, { buffer: 'frameB', start: -1, end: 4 }).code, 'INVALID_RANGE');
+  assert.equal(buildRangeHistory(r, { buffer: 'frameB', start: 0, end: 9 }).code, 'INVALID_RANGE');
+  assert.equal(buildRangeHistory(r, { buffer: 'frameB', start: 4, end: 4 }).code, 'INVALID_RANGE');
+  assert.equal(buildRangeHistory(r, { buffer: 'nope', start: 0, end: 1 }).code, 'UNKNOWN_BUFFER');
+});
+
+test('沿革：尚无成功复核结论时拒绝并提示，不展示任何旧证据', () => {
+  const rejected = analyze(scenarios.missingAcquire.input);
+  const h = buildRangeHistory(rejected, { buffer: 'frameA', start: 0, end: 8 });
+  assert.equal(h.ok, false);
+  assert.equal(h.code, 'NO_SUCCESSFUL_REVIEW');
+  assert.equal(h.segments, undefined);
+});
+
+test('沿革：默认区间为整个声明的缓冲区', () => {
+  const r = analyze(scenarios.completeTransfer.input);
+  const h = buildRangeHistory(r, { buffer: 'frameA' });
+  assert.equal(h.ok, true);
+  assert.deepEqual([h.start, h.end], [0, 16]);
 });

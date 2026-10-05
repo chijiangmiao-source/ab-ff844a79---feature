@@ -43,4 +43,30 @@ test('Worker 入口在 Worker 全局中完成偏序复核并回传结果', () =>
   // 结果来自独立 VM realm，用 JSON 做结构化比较
   assert.deepEqual(JSON.parse(JSON.stringify(messages[1].executableOrder.map((x) => x.id))), ['D1', 'E1']);
   assert.equal(messages[1].affectedRanges.E1.reads[0].evidence.acquireBy, 'E1');
+  const passed = messages[1];
+
+  // { result, range }：Worker 对通过结论构建区间沿革（分段 + 移交证据）
+  sandbox.self.onmessage({ data: { result: passed, range: { buffer: 'frameA', start: 0, end: 16 } } });
+  assert.equal(messages.length, 3);
+  const h = messages[2];
+  assert.equal(h.ok, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.segments.map((s) => [s.start, s.end]))), [[0, 8], [8, 12], [12, 16]]);
+  const seg0 = h.segments[0];
+  assert.deepEqual(JSON.parse(JSON.stringify(seg0.events.map((e) => e.kind))), ['write', 'release', 'acquire', 'read']);
+  assert.equal(seg0.events[2].evidence.acquireBy, 'E1');
+  // 被 E1 写入的段属主为 encode-q；未写入段保持初始状态
+  assert.equal(h.segments[1].finalOwner, 'encode-q');
+  assert.equal(h.segments[2].initial, true);
+
+  // 部分重写场景：[0,4) v1 / [4,6) v2 / [6,8) 初始
+  sandbox.self.onmessage({ data: { input: scenarios.partialRewrite.input, range: { buffer: 'frameB', start: 0, end: 8 } } });
+  const ph = messages[3];
+  assert.equal(ph.ok, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(ph.segments.map((s) => [s.start, s.end]))), [[0, 4], [4, 6], [6, 8]]);
+  assert.equal(ph.segments[2].initial, true);
+
+  // 非法区间：Worker 返回可操作错误而非旧沿革
+  sandbox.self.onmessage({ data: { result: passed, range: { buffer: 'frameA', start: 9, end: 3 } } });
+  assert.equal(messages[4].ok, false);
+  assert.equal(messages[4].code, 'INVALID_RANGE');
 });

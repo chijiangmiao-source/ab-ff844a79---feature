@@ -5,6 +5,7 @@
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 const scenarios = require('../src/scenarios');
+const { buildRangeHistory } = require('../src/verifier/engine');
 
 const BASE = process.env.BASE_URL || '';
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -82,6 +83,64 @@ async function runChecks(base) {
     && read.evidence.via && read.evidence.via.kind === 'semaphore',
     '呈现完整移交证据（releaseBy=D1, acquireBy=E1, via=semaphore）');
   check(!!(good.json && good.json.transfers.length === 1), '移交记录 1 段 frameA[0..7]');
+
+  console.log('[6] 部分重写后分段沿革 POST /api/history');
+  const hist = await request(base, 'POST', '/api/history', {
+    input: scenarios.partialRewrite.input,
+    range: { buffer: 'frameB', start: 0, end: 8 }
+  });
+  check(hist.status === 200, `HTTP 200（实际 ${hist.status}）`);
+  const segs = hist.json && hist.json.segments;
+  const bounds = segs && segs.map((s) => [s.start, s.end]);
+  check(JSON.stringify(bounds) === '[[0,4],[4,6],[6,8]]',
+    `切分为 [0,4)/[4,6)/[6,8) 不重叠连续片段（实际 ${JSON.stringify(bounds)}）`);
+  if (segs) {
+    check(segs[0].finalVersion === 1 && segs[0].finalOwner === 'encode-q',
+      '[0,4) 最终可见 v1，属主 encode-q');
+    const acquire = segs[0].events.find((e) => e.kind === 'acquire');
+    check(!!acquire && acquire.evidence.releaseBy === 'D1' && acquire.evidence.acquireBy === 'E1'
+      && acquire.evidence.via && acquire.evidence.via.kind === 'semaphore'
+      && acquire.evidence.via.semaphore === 'timeline/decode',
+      '[0,4) 呈现 releaseBy/acquireBy 与信号量来源 timeline/decode');
+    check(JSON.stringify(segs[0].events.map((e) => e.kind)) === '["write","release","acquire","read"]',
+      '沿革按可执行序列出写入/释放/获取/读取');
+    check(segs[1].finalVersion === 2 && segs[1].events[segs[1].events.length - 1].submissionId === 'E1',
+      '[4,6) 被 E1 部分重写为 v2，未被邻段 v1 证据覆盖');
+    check(segs[2].initial === true && segs[2].written === false && segs[2].events.length === 0,
+      '[6,8) 从未写入，明确保持初始状态');
+  }
+
+  console.log('[7] 非法区间 / 未知缓冲区 -> 可操作错误');
+  const badRange = await request(base, 'POST', '/api/history', {
+    input: scenarios.partialRewrite.input,
+    range: { buffer: 'frameB', start: 5, end: 3 }
+  });
+  check(badRange.status === 422 && badRange.json && badRange.json.code === 'INVALID_RANGE',
+    `start>=end/越界 -> 422 INVALID_RANGE（实际 ${badRange.status} ${badRange.json && badRange.json.code}）`);
+  const unknownBuf = await request(base, 'POST', '/api/history', {
+    input: scenarios.partialRewrite.input,
+    range: { buffer: 'ghost', start: 0, end: 1 }
+  });
+  check(unknownBuf.status === 422 && unknownBuf.json && unknownBuf.json.code === 'UNKNOWN_BUFFER',
+    `未知缓冲区 -> 422 UNKNOWN_BUFFER（实际 ${unknownBuf.status}）`);
+
+  console.log('[8] 尚无成功复核结论 -> NO_SUCCESSFUL_REVIEW，不展示旧证据');
+  const noPass = await request(base, 'POST', '/api/history', { range: { buffer: 'frameB', start: 0, end: 1 } });
+  check(noPass.status === 422 && noPass.json && noPass.json.code === 'NO_SUCCESSFUL_REVIEW'
+    && !noPass.json.segments,
+    '无 input/result 时返回 422 NO_SUCCESSFUL_REVIEW 且不带任何沿革片段');
+
+  console.log('[9] Worker 引擎与 HTTP 复核给出相同沿革（同构一致性）');
+  for (const [name, scn, range] of [
+    ['完整移交', scenarios.completeTransfer, { buffer: 'frameA', start: 0, end: 16 }],
+    ['部分重写', scenarios.partialRewrite, { buffer: 'frameB', start: 0, end: 8 }]
+  ]) {
+    const viaHttp = await request(base, 'POST', '/api/history', { input: scn.input, range });
+    const viaWorkerLike = buildRangeHistory(require('../src/verifier/engine').analyze(scn.input), range);
+    check(viaHttp.status === 200, `${name}：HTTP 200`);
+    check(JSON.stringify(viaHttp.json) === JSON.stringify(viaWorkerLike),
+      `${name}：HTTP /api/history 与 Worker 共用引擎沿革逐字段一致`);
+  }
 
   return failures;
 }
