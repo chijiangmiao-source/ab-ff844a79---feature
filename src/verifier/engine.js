@@ -7,6 +7,11 @@
 //   2. 提交等待时间线信号量值 v：递增到该值的那个 signal 提交必须先于它（信号量边）
 // 拒绝：等待无满足来源（无信号或信号值不足）、偏序成环（死锁）
 // 逐单元维护：owner(属主队列) / version(最新写版本) / pending(待获取移交) / transfer(最近一次完成的移交证据)
+//
+// 复核通过后可查询访问证据沿革（accessHistory）：对指定缓冲区的半开单元区间，
+// 按可执行次序列出实际触及每个单元的 write/release/acquire/read（含版本、当时所有者、
+// 提交编号与跨队列移交证据），连续且证据完全相同的单元合并为一段；
+// 部分单元被后来写入/移交时切分为不重叠连续片段，未写入单元保持初始状态。
 
 // UMD：Node（require）与浏览器 Web Worker（importScripts）共用
 (function (root, factory) {
@@ -59,7 +64,12 @@ function mergeSegments(segments) {
   return merged;
 }
 
-function analyze(input) {
+// 单元的初始状态（从未写入）：无属主、版本 0
+const INITIAL_CELL_STATE = Object.freeze({ owner: null, version: 0 });
+
+// 完整复核模拟：结构校验 -> 偏序 DAG -> 环检测 -> 拓扑可执行序 -> 逐单元状态机。
+// 通过时除复核结果外还返回逐单元访问事件（cellEvents）与最终单元状态（cells），供沿革查询使用。
+function simulate(input) {
   const structuralErrors = validateInput(input);
   if (structuralErrors.length) {
     return err('STRUCTURE_INVALID', '操作页录入不合法', { errors: structuralErrors });
@@ -203,10 +213,18 @@ function analyze(input) {
     if (!cells.has(key)) cells.set(key, { owner: null, writer: null, version: 0, pending: null, transfer: null });
     return cells.get(key);
   };
+  // 逐单元访问事件（沿革查询用）：key -> 按可执行次序排列的事件数组
+  const cellEvents = new Map();
+  const record = (buffer, offset, ev) => {
+    const key = rangeKey(buffer, offset);
+    if (!cellEvents.has(key)) cellEvents.set(key, []);
+    cellEvents.get(key).push(ev);
+  };
 
   const executed = [];
   const transfers = [];
   const summary = {};
+  let opSeq = 0; // 可执行次序中的操作序号：同一操作触及的所有单元共享同一序号
 
   for (const si of schedule) {
     const s = subs[si];
@@ -216,6 +234,7 @@ function analyze(input) {
     for (let oi = 0; oi < s.operations.length; oi += 1) {
       const op = s.operations[oi];
       const opRange = { buffer: op.buffer, start: op.offset, end: op.offset + op.length };
+      opSeq += 1;
 
       if (op.type === 'write') {
         for (const c of cellsOf(op)) {
@@ -232,6 +251,7 @@ function analyze(input) {
           cell.writer = s.id;
           cell.transfer = null; // 新写使旧移交证据失效
           seg.writes.push({ ...opRange, access: 'write', version: cell.version });
+          record(c.buffer, c.offset, { seq: opSeq, access: 'write', submissionId: s.id, queue: s.queue, version: cell.version, owner: cell.owner });
         }
       } else if (op.type === 'release') {
         for (const c of cellsOf(op)) {
@@ -245,6 +265,7 @@ function analyze(input) {
           }
           cell.pending = { releaseBy: s.id, fromQueue: s.queue, version: cell.version, releaseIndex: si };
           seg.releases.push({ ...opRange, version: cell.version });
+          record(c.buffer, c.offset, { seq: opSeq, access: 'release', submissionId: s.id, queue: s.queue, version: cell.version, owner: cell.owner });
         }
       } else if (op.type === 'acquire') {
         for (const c of cellsOf(op)) {
@@ -288,6 +309,7 @@ function analyze(input) {
           cell.pending = null;
           acquired.add(rangeKey(c.buffer, c.offset));
           seg.acquires.push({ buffer: c.buffer, start: c.offset, end: c.offset + 1, version: cell.version, evidence });
+          record(c.buffer, c.offset, { seq: opSeq, access: 'acquire', submissionId: s.id, queue: s.queue, version: cell.version, owner: cell.owner, evidence });
         }
       } else {
         // read
@@ -341,6 +363,9 @@ function analyze(input) {
             buffer: c.buffer, start: c.offset, end: c.offset + 1, access: 'read',
             version: cell.version, evidence
           });
+          const ev = { seq: opSeq, access: 'read', submissionId: s.id, queue: s.queue, version: cell.version, owner: cell.owner };
+          if (evidence) ev.evidence = evidence; // 经完整移交取得的读取携带移交证据
+          record(c.buffer, c.offset, ev);
         }
       }
     }
@@ -380,18 +405,94 @@ function analyze(input) {
     executableOrder: executed,
     affectedRanges,
     transfers: transferSegments,
-    timelines: Object.fromEntries([...signalIndexOf.entries()].map(([k, v]) => [k, { signaled: v }]))
+    timelines: Object.fromEntries([...signalIndexOf.entries()].map(([k, v]) => [k, { signaled: v }])),
+    cells,
+    cellEvents
   };
 }
 
-  return { analyze };
+// 复核接口（/api/verify 与 Worker 共用）：输出保持稳定，不含内部逐单元状态
+function analyze(input) {
+  const r = simulate(input);
+  if (!r.ok) return r;
+  return {
+    ok: true,
+    executableOrder: r.executableOrder,
+    affectedRanges: r.affectedRanges,
+    transfers: r.transfers,
+    timelines: r.timelines
+  };
+}
+
+// 访问证据沿革：复核通过后，对指定缓冲区的半开单元区间 [start, end)，
+// 按可执行次序列出实际触及各单元的写入/释放/获取/读取。
+//   - 连续且证据完全相同的单元合并为一段（版本、当时所有者、提交编号、移交证据一致）；
+//   - 仅部分单元被后来写入/移交时切分为不重叠连续片段，互不覆盖；
+//   - 未写入单元保持初始状态（无属主、v0、无事件）；
+//   - 区间非法返回 RANGE_INVALID（可操作提示）；复核未通过则原样返回拒绝，不产出任何沿革。
+function accessHistory(input, query) {
+  const structuralErrors = validateInput(input);
+  if (structuralErrors.length) {
+    return err('STRUCTURE_INVALID', '操作页录入不合法', { errors: structuralErrors });
+  }
+
+  const q = query || {};
+  const declared = input.buffers.find((b) => b.name === q.buffer);
+  if (!declared) {
+    return err('RANGE_INVALID', `沿革区间非法：缓冲区 ${q.buffer == null ? '（未选择）' : q.buffer} 未在录入中声明，请改选已声明的缓冲区`, {
+      buffer: q.buffer == null ? null : q.buffer,
+      declaredBuffers: input.buffers.map((b) => b.name)
+    });
+  }
+  const { start, end } = q;
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end <= start || end > declared.length) {
+    return err('RANGE_INVALID', `沿革区间非法：${declared.name}[${start}..${end}) 不是可接受的半开区间，请调整为 0 ≤ start < end ≤ ${declared.length}（缓冲区 ${declared.name} 长度）后重新查询`, {
+      buffer: declared.name, start, end, bufferLength: declared.length
+    });
+  }
+
+  const r = simulate(input);
+  if (!r.ok) return r; // 尚无成功复核结论：原样返回拒绝，不产出沿革证据
+
+  // 逐单元取事件与最终状态，连续且证据完全相同的相邻单元合并为一段
+  const segments = [];
+  let lastSig = null;
+  for (let offset = start; offset < end; offset += 1) {
+    const key = rangeKey(declared.name, offset);
+    const events = r.cellEvents.get(key) || []; // 未触及的单元无事件：保持初始状态
+    const cell = r.cells.get(key);
+    const final = cell ? { owner: cell.owner, version: cell.version } : { ...INITIAL_CELL_STATE };
+    const sig = JSON.stringify([events, final]);
+    const last = segments[segments.length - 1];
+    if (last && lastSig === sig) {
+      last.end = offset + 1;
+    } else {
+      segments.push({ buffer: declared.name, start: offset, end: offset + 1, final, events });
+      lastSig = sig;
+    }
+  }
+
+  return {
+    ok: true,
+    query: { buffer: declared.name, start, end },
+    initial: { ...INITIAL_CELL_STATE },
+    executableOrder: r.executableOrder,
+    segments
+  };
+}
+
+  return { analyze, accessHistory };
 });
 
 // Web Worker 消息协议（仅在 Worker realm 注册；Node 下 require 不受影响）
+//   { input }         -> analyze 复核
+//   { input, query }  -> accessHistory 沿革查询（与 HTTP /api/history 同构）
 if (typeof self !== 'undefined' && typeof self.importScripts === 'function') {
   self.onmessage = (e) => {
     try {
-      self.postMessage(self.analyze(e.data && e.data.input));
+      const data = e.data || {};
+      const out = data.query ? self.accessHistory(data.input, data.query) : self.analyze(data.input);
+      self.postMessage(out);
     } catch (ex) {
       self.postMessage({ ok: false, code: 'WORKER_ERROR', message: String((ex && ex.stack) || ex) });
     }

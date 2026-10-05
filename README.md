@@ -26,6 +26,20 @@
 3. 跨队列读只有在 **释放 + 信号量先后关系 + 获取** 三类证据完整匹配时才可见。
 4. 通过时返回：可执行次序（拓扑序）、每个提交受影响区间（读/写/释放/获取，含版本与移交证据）、完整移交记录。
 
+## 访问证据沿革
+
+复核通过后，审查员可选择**缓冲区与半开单元区间 `[start, end)`**，查看这些单元从初始状态到最终可见版本的访问证据沿革，无需逐条比对提交摘要：
+
+- 沿革按**可执行次序**列出实际触及各区间的 `write` / `release` / `acquire` / `read`，每条事件含版本、当时所有者与提交编号；跨队列移交另附 `releaseBy`、`acquireBy` 与信号量来源（`via`）。
+- **连续且证据完全相同**的单元合并为一段；区间只有部分单元被后来写入或移交时，切分为**不重叠的连续片段**，任何单元的证据都不会覆盖邻近单元。
+- 从未写入的单元明确**保持初始状态**（无属主、`v0`、无事件）。
+- 区间非法（未声明缓冲区、越界、空/倒置区间）返回 `RANGE_INVALID` 可操作提示；**尚无成功复核结论**时原样返回复核拒绝，不产出任何沿革证据。
+- 操作页中 Worker 与 HTTP 回退走同一引擎（`accessHistory`），改选缓冲区或区间后二者给出相同沿革；改选后旧沿革即清空，不误展示旧证据。
+
+接口：`POST /api/history`，请求体 `{ input, query: { buffer, start, end } }`。
+成功 `200`：`{ ok, query, initial, executableOrder, segments[] }`（每段含 `final` 与按序 `events`）；
+区间非法 `400 RANGE_INVALID`；录入结构非法 `400 STRUCTURE_INVALID`；复核未通过 `422`（与 `/api/verify` 相同的拒绝体）。
+
 复核在浏览器 **Web Worker**（`src/verifier/worker.js`）中执行，HTTP `POST /api/verify` 提供同构实现用于冒烟。
 
 ## 本地运行
@@ -39,6 +53,7 @@ npm start                 # http://localhost:3000/
 - 健康响应：`GET /health`
 - 标准场景：`GET /api/scenarios`
 - 复核：`POST /api/verify`
+- 访问证据沿革：`POST /api/history`
 
 ## Compose
 
@@ -50,11 +65,12 @@ docker compose run --rm verify       # 一次性验收服务，以退出码报�
 
 `verify` 服务依次执行：
 
-1. 规则代码测试（`node --test`，含 Worker 协议、两类读取场景、死锁环、错误属主、过期版本等）；
-2. 操作页构建检查（结构与内联脚本可编译、Worker 接线）；
+1. 规则代码测试（`node --test`，含 Worker 协议、两类读取场景、分段沿革、死锁环、错误属主、过期版本等）；
+2. 操作页构建检查（结构与内联脚本可编译、Worker 接线、沿革面板）；
 3. API/HTTP 冒烟：
    - “缺少获取的跨队列读取” → HTTP 422 / `MISSING_ACQUIRE`，定位提交与单元范围；
-   - “完整移交后读取” → HTTP 200，呈现可执行次序、版本 v1 与移交证据（releaseBy/acquireBy/via=semaphore）。
+   - “完整移交后读取” → HTTP 200，呈现可执行次序、版本 v1 与移交证据（releaseBy/acquireBy/via=semaphore）；
+   - “部分重写后分段沿革” → `POST /api/history` 返回 3 个不重叠连续分段（完整移交 v1 / 部分重写 v2 / 保持初始状态），非法区间 400 `RANGE_INVALID`，复核未通过时沿革接口返回相同拒绝且不返回证据。
 
 退出码 `0` 表示验收通过，非 `0` 表示失败。
 
@@ -63,12 +79,12 @@ docker compose run --rm verify       # 一次性验收服务，以退出码报�
 ```
 src/verifier/limits.js    录入上限
 src/verifier/validator.js 结构校验
-src/verifier/engine.js    偏序 DAG + 逐单元状态机（Node / Worker UMD）
+src/verifier/engine.js    偏序 DAG + 逐单元状态机 + 访问证据沿革（Node / Worker UMD）
 src/verifier/worker.js    Web Worker 入口
-src/scenarios.js          标准场景（缺少获取 / 完整移交 / 死锁）
-src/public/index.html     操作页
+src/scenarios.js          标准场景（缺少获取 / 完整移交 / 部分重写分段沿革 / 死锁）
+src/public/index.html     操作页（含沿革查询面板）
 src/server.js             HTTP 服务
-test/                     node:test 规则测试
+test/                     node:test 规则测试（引擎 / 沿革 / Worker 协议）
 scripts/check-page.js     页面构建检查
 scripts/smoke-http.js     HTTP 冒烟
 scripts/verify.js         一次性验收入口

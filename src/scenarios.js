@@ -61,9 +61,42 @@ const scenarios = {
     }
   },
 
-  // 场景三：同队列互相等待对方的时间线 —— 死锁环
-  deadlock: {
-    title: '信号量等待成环（死锁，应拒绝）',
+  // 场景三：部分重写后的分段沿革 —— 应通过；查询 frameA[0..16) 时沿革切分为
+  // [0..8) 完整移交 v1 / [8..12) 被 E1 重写为 v2 / [12..16) 保持初始状态 三段
+  partialRewrite: {
+    title: '部分重写后的分段沿革（应通过）',
+    input: {
+      queues: ['decode-q', 'encode-q'],
+      buffers: [{ name: 'frameA', length: 16 }],
+      submissions: [
+        {
+          id: 'D1',
+          queue: 'decode-q',
+          signal: { semaphore: 'timeline/decode' },
+          operations: [
+            { type: 'write', buffer: 'frameA', offset: 0, length: 12 },
+            { type: 'release', buffer: 'frameA', offset: 0, length: 12 }
+          ]
+        },
+        {
+          id: 'E1',
+          queue: 'encode-q',
+          wait: { semaphore: 'timeline/decode', value: 1 },
+          operations: [
+            { type: 'acquire', buffer: 'frameA', offset: 0, length: 12 },
+            { type: 'read', buffer: 'frameA', offset: 0, length: 12 },
+            // 只重写 [8..12) 四个单元：部分单元被后来写入，沿革必须分段
+            { type: 'write', buffer: 'frameA', offset: 8, length: 4 }
+          ]
+        }
+      ]
+    },
+    // 推荐的沿革查询区间（半开 [start, end)）
+    query: { buffer: 'frameA', start: 0, end: 16 }
+  },
+
+  // 场景四：同队列互相等待对方的时间线 —— 死锁环
+  deadlock: {    title: '信号量等待成环（死锁，应拒绝）',
     input: {
       queues: ['decode-q'],
       buffers: [{ name: 'frameA', length: 4 }],

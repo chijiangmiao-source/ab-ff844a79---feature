@@ -3,7 +3,7 @@
 const path = require('path');
 const http = require('http');
 const express = require('express');
-const { analyze } = require('./verifier/engine');
+const { analyze, accessHistory } = require('./verifier/engine');
 const { validateInput } = require('./verifier/validator');
 const scenarios = require('./scenarios');
 
@@ -27,6 +27,16 @@ app.post('/api/verify', (req, res) => {
   const result = analyze(req.body);
   if (!result.ok) return res.status(422).json(result);
   res.json(result);
+});
+
+// 访问证据沿革：{ input, query:{buffer,start,end} } -> 分段沿革
+// 与浏览器 Worker 同构（同一引擎实现），复核未通过或区间非法时不返回任何沿革证据
+app.post('/api/history', (req, res) => {
+  const body = req.body || {};
+  const result = accessHistory(body.input, body.query);
+  if (result.ok) return res.json(result);
+  const status = result.code === 'STRUCTURE_INVALID' || result.code === 'RANGE_INVALID' ? 400 : 422;
+  res.status(status).json(result);
 });
 
 app.use(express.static(path.join(__dirname, 'public')));

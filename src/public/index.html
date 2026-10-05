@@ -45,6 +45,9 @@
   pre.ev { background:#0d1322; border:1px solid var(--line); border-radius:6px; padding:8px; font-size:12px; overflow:auto; margin:6px 0 0; }
   .seq { font-family:ui-monospace,monospace; }
   .seq span.more::before { content:" → "; color:var(--muted); }
+  .evline { margin:3px 0; }
+  .evline .seqno { color:var(--muted); font-size:11px; margin-right:4px; font-family:ui-monospace,monospace; }
+  .segfinal { font-size:12px; }
 </style>
 </head>
 <body>
@@ -60,6 +63,7 @@
       <div class="row">
         <button class="ghost" data-scn="missingAcquire">缺少获取的跨队列读取（应拒绝）</button>
         <button class="ghost" data-scn="completeTransfer">完整移交后读取（应通过）</button>
+        <button class="ghost" data-scn="partialRewrite">部分重写后的分段沿革（应通过）</button>
         <button class="ghost" data-scn="deadlock">死锁环（应拒绝）</button>
       </div>
     </div>
@@ -96,6 +100,22 @@
       <h2>复核结果</h2>
       <p class="muted">在左侧录入或载入场景后点击“提交复核”。复核器在 Worker 中按队列顺序与信号量等待建立偏序，并逐单元维护属主、最新写版本与待获取移交状态。</p>
     </div>
+
+    <div class="panel" id="historyPanel">
+      <h2>单元访问证据沿革</h2>
+      <div class="row">
+        <select id="histBuffer" title="缓冲区"></select>
+        <span class="muted">半开区间 [</span>
+        <input type="number" id="histStart" min="0" value="0" title="start（含）" />
+        <span class="muted">,</span>
+        <input type="number" id="histEnd" min="1" value="1" title="end（不含）" />
+        <span class="muted">)</span>
+        <button id="histBtn" class="ghost">查看沿革</button>
+      </div>
+      <div id="historyResult">
+        <p class="muted">复核通过后，选择缓冲区与半开单元区间，查看这些单元从初始状态到最终可见版本的写入、释放、获取与读取证据沿革（连续且证据完全相同的单元合并展示）。</p>
+      </div>
+    </div>
   </section>
 </main>
 
@@ -107,6 +127,8 @@ const LIMITS = { MAX_QUEUES: 3, MAX_BUFFERS: 16, MAX_BUFFER_LEN: 64, MAX_SUBMISS
 const OP_TYPES = ['read', 'write', 'release', 'acquire'];
 const state = { queues: [], buffers: [], submissions: [] };
 let uid = 0;
+// 是否已有通过的复核结论：尚无成功结论时沿革查询显示可操作提示，不展示旧证据
+let lastVerifyOk = false;
 
 function el(tag, cls, text) {
   const e = document.createElement(tag);
@@ -225,7 +247,119 @@ function renderSubmissions() {
   document.getElementById('limitHint').textContent = over ? '长度超过 64 的缓冲区将被拒绝' : '';
 }
 
-function renderAll() { renderQueues(); renderBuffers(); renderSubmissions(); }
+function renderAll() {
+  renderQueues();
+  renderBuffers();
+  renderSubmissions();
+  renderHistoryControls();
+  // 模型发生结构性变更：旧沿革可能已失效，清空避免误展示旧证据
+  resetHistory();
+}
+
+// ---- 单元访问证据沿革 ----
+const HIST_PLACEHOLDER = '复核通过后，选择缓冲区与半开单元区间，查看这些单元从初始状态到最终可见版本的写入、释放、获取与读取证据沿革（连续且证据完全相同的单元合并展示）。';
+
+function findBuffer(name) {
+  return state.buffers.find((b) => b.name === name);
+}
+
+// 刷新沿革查询的缓冲区选项（保留仍存在的选项）
+function renderHistoryControls() {
+  const sel = document.getElementById('histBuffer');
+  const prev = sel.value;
+  sel.innerHTML = '';
+  state.buffers.forEach((b) => {
+    const o = document.createElement('option');
+    o.value = b.name;
+    o.textContent = `${b.name}（长度 ${b.length}）`;
+    sel.append(o);
+  });
+  if (prev && findBuffer(prev)) sel.value = prev;
+}
+
+function resetHistory(msg) {
+  const box = document.getElementById('historyResult');
+  box.innerHTML = '';
+  box.append(el('p', 'muted', msg || HIST_PLACEHOLDER));
+}
+
+function showHistoryHint(msg) {
+  const box = document.getElementById('historyResult');
+  box.innerHTML = '';
+  const p = el('p', null, '⚠️ ');
+  p.append(el('span', 'badge-bad', '无法展示沿革'));
+  p.append(document.createTextNode(` ${msg}`));
+  box.append(p);
+}
+
+function renderHistory(r) {
+  const box = document.getElementById('historyResult');
+  box.innerHTML = '';
+  if (!r.ok) {
+    // 复核未通过 / 区间非法：仅显示可操作提示，不渲染任何分段证据
+    showHistoryHint(`[${r.code}] ${r.message}`);
+    return;
+  }
+  const head = el('p', null);
+  head.append(el('span', 'badge-ok', '沿革'));
+  head.append(document.createTextNode(
+    `：${r.query.buffer}[${r.query.start}..${r.query.end - 1}] · 初始状态 属主=无 v0（未写入）· 共 ${r.segments.length} 个不重叠连续分段`
+  ));
+  box.append(head);
+  r.segments.forEach((seg, i) => {
+    const card = el('div', 'card');
+    const hd = el('div', 'hd');
+    hd.append(el('span', 'tag', `分段 ${i + 1}`));
+    hd.append(el('span', null, `${seg.buffer}[${seg.start}..${seg.end - 1}]`));
+    hd.append(el('span', 'segfinal muted',
+      seg.final.owner === null
+        ? '最终：保持初始状态（未写入，属主=无 v0）'
+        : `最终：属主 ${seg.final.owner} · v${seg.final.version}`));
+    card.append(hd);
+    if (!seg.events.length) {
+      card.append(el('p', 'muted', '无访问事件：该片段自初始状态起未被写入或移交。'));
+    } else {
+      seg.events.forEach((ev) => {
+        const line = el('div', 'evline');
+        line.append(el('span', 'seqno', `#${ev.seq}`));
+        line.append(el('span', `pill ${ev.access}`, ev.access));
+        line.append(document.createTextNode(`${ev.submissionId}@${ev.queue} · v${ev.version} · 当时属主 ${ev.owner || '无'}`));
+        if (ev.evidence) {
+          line.append(el('pre', 'ev', JSON.stringify(ev.evidence, null, 1)));
+        }
+        card.append(line);
+      });
+    }
+    box.append(card);
+  });
+}
+
+function queryHistory() {
+  if (!lastVerifyOk) {
+    showHistoryHint('尚无通过的复核结论：请先在左侧“提交复核”并通过，再查看单元访问证据沿革。');
+    return;
+  }
+  const buffer = document.getElementById('histBuffer').value;
+  const start = Number(document.getElementById('histStart').value);
+  const end = Number(document.getElementById('histEnd').value);
+  const b = findBuffer(buffer);
+  if (!b) {
+    showHistoryHint(`缓冲区 ${buffer || '（未选择）'} 未声明，请改选已声明的缓冲区后重新查询。`);
+    return;
+  }
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end <= start || end > b.length) {
+    showHistoryHint(`区间 [${start}, ${end}) 非法：需满足 0 ≤ start < end ≤ ${b.length}（缓冲区 ${b.name} 长度），请调整后重新查询。`);
+    return;
+  }
+  const box = document.getElementById('historyResult');
+  box.innerHTML = '<p class="muted">沿革查询中（Worker 重放可执行次序）…</p>';
+  const input = gatherInput();
+  const query = { buffer, start, end };
+  // 与 /api/history 同构：Worker 不可用时回退 HTTP，二者由同一引擎给出相同沿革
+  runEngine({ input, query }, '/api/history', { input, query })
+    .then((r) => renderHistory(r))
+    .catch((e) => showHistoryHint(`请求失败: ${e}`));
+}
 
 function gatherInput() {
   return {
@@ -251,6 +385,13 @@ function loadScenario(data) {
     operations: s.operations.map((o) => ({ ...o }))
   }));
   renderAll();
+  // 沿革区间默认设为第一个缓冲区的完整半开范围
+  const first = state.buffers[0];
+  if (first) {
+    document.getElementById('histBuffer').value = first.name;
+    document.getElementById('histStart').value = 0;
+    document.getElementById('histEnd').value = first.length;
+  }
 }
 
 const rangeText = (r) => `${r.buffer}[${r.start}..${r.end - 1}]`;
@@ -311,6 +452,8 @@ function renderResult(box, r) {
       tr.append(a, b, c); t2.append(tr);
     });
     box.append(t2);
+    lastVerifyOk = true;
+    resetHistory('复核已通过：选择缓冲区与半开区间后点击“查看沿革”。');
   } else {
     box.className = 'panel bad';
     box.append(el('h2', null, '复核结果'));
@@ -335,6 +478,8 @@ function renderResult(box, r) {
     });
     if (dl.length) box.append(table);
     if (r.edges) box.append(el('pre', 'ev', JSON.stringify(r.edges, null, 1)));
+    lastVerifyOk = false;
+    resetHistory('本次复核未通过：修正后重新提交复核，通过后方可查看单元访问证据沿革。');
   }
 }
 
@@ -351,12 +496,41 @@ function getWorker() {
   return reviewWorker;
 }
 
-function verifyViaApi(input) {
-  return fetch('/api/verify', {
+function postApi(path, payload) {
+  return fetch(path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(input)
+    body: JSON.stringify(payload)
   }).then((resp) => resp.json());
+}
+
+// 统一执行入口：优先 Web Worker（与 HTTP 同构的同一引擎），Worker 忙/不可用/超时时回退 HTTP API
+function runEngine(message, apiPath, apiPayload) {
+  const w = getWorker();
+  if (w && !w._busy) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        // Worker 无响应时回退
+        try { w.terminate(); } catch { /* ignore */ }
+        reviewWorker = null;
+        resolve(postApi(apiPath, apiPayload));
+      }, 4000);
+      w._busy = true;
+      w.onmessage = (e) => {
+        clearTimeout(timer);
+        w._busy = false;
+        resolve(e.data);
+      };
+      w.onerror = () => {
+        clearTimeout(timer);
+        w._busy = false;
+        reviewWorker = null;
+        resolve(postApi(apiPath, apiPayload));
+      };
+      w.postMessage(message);
+    });
+  }
+  return postApi(apiPath, apiPayload);
 }
 
 function verifyPage() {
@@ -364,30 +538,7 @@ function verifyPage() {
   box.className = 'panel';
   box.innerHTML = '<h2>复核结果</h2><p class="muted">复核中（Worker 偏序分析）…</p>';
   const input = gatherInput();
-  const w = getWorker();
-  if (w && !w._busy) {
-    const timer = setTimeout(() => {
-      // Worker 无响应时回退
-      try { w.terminate(); } catch { /* ignore */ }
-      reviewWorker = null;
-      verifyViaApi(input).then((r) => renderResult(box, r));
-    }, 4000);
-    w._busy = true;
-    w.onmessage = (e) => {
-      clearTimeout(timer);
-      w._busy = false;
-      renderResult(box, e.data);
-    };
-    w.onerror = () => {
-      clearTimeout(timer);
-      w._busy = false;
-      reviewWorker = null;
-      verifyViaApi(input).then((r) => renderResult(box, r));
-    };
-    w.postMessage({ input });
-    return;
-  }
-  verifyViaApi(input)
+  runEngine({ input }, '/api/verify', input)
     .then((r) => renderResult(box, r))
     .catch((e) => {
       box.className = 'panel bad';
@@ -408,6 +559,19 @@ document.getElementById('addSubmission').onclick = () => {
   renderAll();
 };
 document.getElementById('verifyBtn').onclick = verifyPage;
+document.getElementById('histBtn').onclick = queryHistory;
+// 改选缓冲区：区间重置为整个缓冲区；改选缓冲区或区间后清空旧沿革，避免误展示旧证据
+document.getElementById('histBuffer').onchange = () => {
+  const b = findBuffer(document.getElementById('histBuffer').value);
+  if (b) {
+    document.getElementById('histStart').value = 0;
+    document.getElementById('histEnd').value = b.length;
+  }
+  resetHistory('已改选缓冲区：点击“查看沿革”获取新区间的沿革。');
+};
+['histStart', 'histEnd'].forEach((id) => {
+  document.getElementById(id).oninput = () => resetHistory('区间已变更：点击“查看沿革”重新获取。');
+});
 document.getElementById('exportBtn').onclick = () => {
   const blob = new Blob([JSON.stringify(gatherInput(), null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
@@ -426,6 +590,7 @@ document.querySelectorAll('[data-scn]').forEach((btn) => {
 // 默认载入“缺少获取”场景，便于首屏直接复核
 window.verifyPage = verifyPage;
 window.renderResult = renderResult;
+window.queryHistory = queryHistory;
 fetch('/api/scenarios').then((r) => r.json()).then((all) => loadScenario(all.missingAcquire)).catch(() => renderAll());
 renderAll();
 </script>
